@@ -88,3 +88,11 @@ OAUTH_CLIENT_SECRET = None
 - Logo by [Laura Barbera](http://www.laurabb.com/)
 - Theme by [Christopher Thompson](https://github.com/breadchris)
 - Notification Sound by [Terrence Martin](https://soundcloud.com/tj-martin-composer)
+
+## Cara Install
+
+- Fork Repo Ini
+- Buka Heroku
+- Deploy Repository Ctfd Di Repository Mu Hasil Fork Repository Ini
+- Install
+- Done
