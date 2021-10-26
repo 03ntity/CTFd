@@ -4,27 +4,24 @@ import os
 import re
 import tempfile
 import zipfile
-from io import BytesIO
 
 import dataset
+import six
+from alembic.util import CommandError
 from flask import current_app as app
-from flask_migrate import upgrade as migration_upgrade
-from sqlalchemy.engine.url import make_url
-from sqlalchemy.exc import ProgrammingError
+from flask_migrate import upgrade
+from sqlalchemy.exc import OperationalError, ProgrammingError
 from sqlalchemy.sql import sqltypes
 
 from CTFd import __version__ as CTFD_VERSION
 from CTFd.cache import cache
-from CTFd.constants.themes import DEFAULT_THEME
 from CTFd.models import db, get_class_by_tablename
-from CTFd.plugins import get_plugin_names
-from CTFd.plugins.migrations import current as plugin_current
-from CTFd.plugins.migrations import upgrade as plugin_upgrade
-from CTFd.utils import get_app_config, set_config, string_types
+from CTFd.utils import get_app_config, set_config
 from CTFd.utils.exports.freeze import freeze_export
 from CTFd.utils.migrations import (
     create_database,
     drop_database,
+    truncate_database,
     get_current_revision,
     stamp_latest_revision,
 )
@@ -44,7 +41,7 @@ def export_ctf():
     tables = db.tables
     for table in tables:
         result = db[table].all()
-        result_file = BytesIO()
+        result_file = six.BytesIO()
         freeze_export(result, fileobj=result_file)
         result_file.seek(0)
         backup_zip.writestr("db/{}.json".format(table), result_file.read())
@@ -56,7 +53,7 @@ def export_ctf():
             "results": [{"version_num": get_current_revision()}],
             "meta": {},
         }
-        result_file = BytesIO()
+        result_file = six.BytesIO()
         json.dump(result, result_file)
         result_file.seek(0)
         backup_zip.writestr("db/alembic_version.json", result_file.read())
@@ -68,7 +65,7 @@ def export_ctf():
     upload_folder = os.path.join(
         os.path.normpath(app.root_path), app.config.get("UPLOAD_FOLDER")
     )
-    for root, _dirs, files in os.walk(upload_folder):
+    for root, dirs, files in os.walk(upload_folder):
         for file in files:
             parent_dir = os.path.basename(root)
             backup_zip.write(
@@ -98,14 +95,6 @@ def import_ctf(backup, erase=True):
             if info.file_size > max_content_length:
                 raise zipfile.LargeZipFile
 
-    # Get list of directories in zipfile
-    member_dirs = [os.path.split(m)[0] for m in members if "/" in m]
-    if "db" not in member_dirs:
-        raise Exception(
-            'CTFd couldn\'t find the "db" folder in this backup. '
-            "The backup may be malformed or corrupted and the import process cannot continue."
-        )
-
     try:
         alembic_version = json.loads(backup.open("db/alembic_version.json").read())
         alembic_version = alembic_version["results"][0]["version_num"]
@@ -134,39 +123,17 @@ def import_ctf(backup, erase=True):
             "The version of CTFd that this backup is from is too old to be automatically imported."
         )
 
-    sqlite = get_app_config("SQLALCHEMY_DATABASE_URI").startswith("sqlite")
-    postgres = get_app_config("SQLALCHEMY_DATABASE_URI").startswith("postgres")
-    mysql = get_app_config("SQLALCHEMY_DATABASE_URI").startswith("mysql")
-
     if erase:
-        # Clear out existing connections to release any locks
-        db.session.close()
-        db.engine.dispose()
-
-        # Kill sleeping processes on MySQL so we don't get a metadata lock
-        # In my testing I didn't find that Postgres or SQLite needed the same treatment
-        # Only run this when not in tests as we can't isolate the queries out
-        # This is a very dirty hack. Don't try this at home kids.
-        if mysql and get_app_config("TESTING", default=False) is False:
-            url = make_url(get_app_config("SQLALCHEMY_DATABASE_URI"))
-            r = db.session.execute("SHOW PROCESSLIST")
-            processes = r.fetchall()
-            for proc in processes:
-                if (
-                    proc.Command == "Sleep"
-                    and proc.User == url.username
-                    and proc.db == url.database
-                ):
-                    proc_id = proc.Id
-                    db.session.execute(f"KILL {proc_id}")
-
-        # Drop database and recreate it to get to a clean state
-        drop_database()
-        create_database()
+        if drop_database():
+            create_database()
+        else:
+            truncate_database()
         # We explicitly do not want to upgrade or stamp here.
         # The import will have this information.
 
     side_db = dataset.connect(get_app_config("SQLALCHEMY_DATABASE_URI"))
+    sqlite = get_app_config("SQLALCHEMY_DATABASE_URI").startswith("sqlite")
+    postgres = get_app_config("SQLALCHEMY_DATABASE_URI").startswith("postgres")
 
     try:
         if postgres:
@@ -195,127 +162,112 @@ def import_ctf(backup, erase=True):
         "db/config.json",
     ]
 
-    # We want to insert certain database tables first so we are specifying
-    # the order with a list. The leftover tables are tables that are from a
-    # plugin (more likely) or a table where we do not care about insertion order
     for item in first:
         if item in members:
             members.remove(item)
 
-    # Upgrade the database to the point in time that the import was taken from
-    migration_upgrade(revision=alembic_version)
+    members = first + members
+
+    upgrade(revision=alembic_version)
+
+    # Create tables created by plugins
+    try:
+        app.db.create_all()
+    except OperationalError as e:
+        if not postgres:
+            raise e
+        else:
+            print("Allowing error during app.db.create_all() due to Postgres")
 
     members.remove("db/alembic_version.json")
 
-    # Combine the database insertion code into a function so that we can pause
-    # insertion between official database tables and plugin tables
-    def insertion(table_filenames):
-        for member in table_filenames:
-            if member.startswith("db/"):
-                table_name = member[3:-5]
+    for member in members:
+        if member.startswith("db/"):
+            table_name = member[3:-5]
 
-                try:
-                    # Try to open a file but skip if it doesn't exist.
-                    data = backup.open(member).read()
-                except KeyError:
-                    continue
+            try:
+                # Try to open a file but skip if it doesn't exist.
+                data = backup.open(member).read()
+            except KeyError:
+                continue
 
-                if data:
-                    table = side_db[table_name]
+            if data:
+                table = side_db[table_name]
 
-                    saved = json.loads(data)
-                    for entry in saved["results"]:
-                        # This is a hack to get SQLite to properly accept datetime values from dataset
-                        # See Issue #246
-                        if sqlite:
-                            direct_table = get_class_by_tablename(table.name)
-                            for k, v in entry.items():
-                                if isinstance(v, string_types):
-                                    # We only want to apply this hack to columns that are expecting a datetime object
-                                    try:
-                                        is_dt_column = (
-                                            type(getattr(direct_table, k).type)
-                                            == sqltypes.DateTime
+                saved = json.loads(data)
+                for entry in saved["results"]:
+                    # This is a hack to get SQLite to properly accept datetime values from dataset
+                    # See Issue #246
+                    if sqlite:
+                        direct_table = get_class_by_tablename(table.name)
+                        for k, v in entry.items():
+                            if isinstance(v, six.string_types):
+                                # We only want to apply this hack to columns that are expecting a datetime object
+                                try:
+                                    is_dt_column = (
+                                        type(getattr(direct_table, k).type)
+                                        == sqltypes.DateTime
+                                    )
+                                except AttributeError:
+                                    is_dt_column = False
+
+                                # If the table is expecting a datetime, we should check if the string is one and convert it
+                                if is_dt_column:
+                                    match = re.match(
+                                        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d", v
+                                    )
+                                    if match:
+                                        entry[k] = datetime.datetime.strptime(
+                                            v, "%Y-%m-%dT%H:%M:%S.%f"
                                         )
-                                    except AttributeError:
-                                        is_dt_column = False
-
-                                    # If the table is expecting a datetime, we should check if the string is one and convert it
-                                    if is_dt_column:
-                                        match = re.match(
-                                            r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d",
-                                            v,
+                                        continue
+                                    match = re.match(
+                                        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}", v
+                                    )
+                                    if match:
+                                        entry[k] = datetime.datetime.strptime(
+                                            v, "%Y-%m-%dT%H:%M:%S"
                                         )
-                                        if match:
-                                            entry[k] = datetime.datetime.strptime(
-                                                v, "%Y-%m-%dT%H:%M:%S.%f"
-                                            )
-                                            continue
-                                        match = re.match(
-                                            r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}", v
-                                        )
-                                        if match:
-                                            entry[k] = datetime.datetime.strptime(
-                                                v, "%Y-%m-%dT%H:%M:%S"
-                                            )
-                                            continue
-                        # From v2.0.0 to v2.1.0 requirements could have been a string or JSON because of a SQLAlchemy issue
-                        # This is a hack to ensure we can still accept older exports. See #867
-                        if member in (
-                            "db/challenges.json",
-                            "db/hints.json",
-                            "db/awards.json",
-                        ):
-                            requirements = entry.get("requirements")
-                            if requirements and isinstance(requirements, string_types):
-                                entry["requirements"] = json.loads(requirements)
+                                        continue
+                    # From v2.0.0 to v2.1.0 requirements could have been a string or JSON because of a SQLAlchemy issue
+                    # This is a hack to ensure we can still accept older exports. See #867
+                    if member in (
+                        "db/challenges.json",
+                        "db/hints.json",
+                        "db/awards.json",
+                    ):
+                        requirements = entry.get("requirements")
+                        if requirements and isinstance(requirements, six.string_types):
+                            entry["requirements"] = json.loads(requirements)
 
-                        try:
-                            table.insert(entry)
-                        except ProgrammingError:
-                            # MariaDB does not like JSON objects and prefers strings because it internally
-                            # represents JSON with LONGTEXT.
-                            # See Issue #973
-                            requirements = entry.get("requirements")
-                            if requirements and isinstance(requirements, dict):
-                                entry["requirements"] = json.dumps(requirements)
-                            table.insert(entry)
+                    try:
+                        table.insert(entry)
+                    except ProgrammingError:
+                        # MariaDB does not like JSON objects and prefers strings because it internally
+                        # represents JSON with LONGTEXT.
+                        # See Issue #973
+                        requirements = entry.get("requirements")
+                        if requirements and isinstance(requirements, dict):
+                            entry["requirements"] = json.dumps(requirements)
+                        table.insert(entry)
 
-                        db.session.commit()
-                    if postgres:
-                        # This command is to set the next primary key ID for the re-inserted tables in Postgres. However,
-                        # this command is very difficult to translate into SQLAlchemy code. Because Postgres is not
-                        # officially supported, no major work will go into this functionality.
-                        # https://stackoverflow.com/a/37972960
-                        if '"' not in table_name and "'" not in table_name:
-                            query = "SELECT setval(pg_get_serial_sequence('{table_name}', 'id'), coalesce(max(id)+1,1), false) FROM \"{table_name}\"".format(  # nosec
+                    db.session.commit()
+                if postgres:
+                    # This command is to set the next primary key ID for the re-inserted tables in Postgres. However,
+                    # this command is very difficult to translate into SQLAlchemy code. Because Postgres is not
+                    # officially supported, no major work will go into this functionality.
+                    # https://stackoverflow.com/a/37972960
+                    if '"' not in table_name and "'" not in table_name:
+                        query = "SELECT setval(pg_get_serial_sequence('{table_name}', 'id'), coalesce(max(id)+1,1), false) FROM \"{table_name}\"".format(  # nosec
+                            table_name=table_name
+                        )
+                        side_db.engine.execute(query)
+                    else:
+                        raise Exception(
+                            "Table name {table_name} contains quotes".format(
                                 table_name=table_name
                             )
-                            side_db.engine.execute(query)
-                        else:
-                            raise Exception(
-                                "Table name {table_name} contains quotes".format(
-                                    table_name=table_name
-                                )
-                            )
-
-    # Insert data from official tables
-    insertion(first)
-
-    # Create tables created by plugins
-    # Run plugin migrations
-    plugins = get_plugin_names()
-    for plugin in plugins:
-        revision = plugin_current(plugin_name=plugin)
-        plugin_upgrade(plugin_name=plugin, revision=revision, lower=None)
-
-    # Insert data for plugin tables
-    insertion(members)
-
-    # Bring plugin tables up to head revision
-    plugins = get_plugin_names()
-    for plugin in plugins:
-        plugin_upgrade(plugin_name=plugin)
+                        )
 
     # Extracting files
     files = [f for f in backup.namelist() if f.startswith("uploads/")]
@@ -333,14 +285,11 @@ def import_ctf(backup, erase=True):
         uploader.store(fileobj=source, filename=filename)
 
     # Alembic sqlite support is lacking so we should just create_all anyway
-    if sqlite:
+    try:
+        upgrade(revision="head")
+    except (OperationalError, CommandError, RuntimeError, SystemExit, Exception):
         app.db.create_all()
         stamp_latest_revision()
-    else:
-        # Run migrations to bring to latest version
-        migration_upgrade(revision="head")
-        # Create any leftover tables, perhaps from old plugins
-        app.db.create_all()
 
     try:
         if postgres:
@@ -354,5 +303,5 @@ def import_ctf(backup, erase=True):
     cache.clear()
 
     # Set default theme in case the current instance or the import does not provide it
-    set_config("ctf_theme", DEFAULT_THEME)
+    set_config("ctf_theme", "core")
     set_config("ctf_version", CTFD_VERSION)
